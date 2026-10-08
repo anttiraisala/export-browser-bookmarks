@@ -81,6 +81,14 @@ Files are created with mode `0600` and the output directory with `0700`.
 
 The tool also writes `manifest.json` and `IMPORT.md`. See [output-format.md](output-format.md).
 
+### Firefox backup file
+
+For Firefox profiles the tool also writes a file in the format of Firefox's own backup (Bookmarks, Manage, Import and Backup, Backup). It is built from the same snapshot of `places.sqlite` as the HTML file, so the two always agree.
+
+Unlike the HTML file, the backup is meant to restore a profile exactly, so it keeps what HTML cannot carry: GUIDs, ids, positions, microsecond timestamps, smart bookmarks and non-web URLs. Page icons are added from `favicons.sqlite`, which is copied and read the same way as `places.sqlite`. If that database is missing, the backup is written without `iconUri` values. The widest known icon of a page is used.
+
+The format is described in [output-format.md](output-format.md).
+
 ## 4. Verification
 
 After rendering the HTML, the tool parses it again with Python's `html.parser` and compares it with the tree it started from:
@@ -89,6 +97,8 @@ After rendering the HTML, the tool parses it again with Python's `html.parser` a
 * the sorted list of bookmark URLs must match exactly.
 
 A mismatch marks the profile as `verification-failed`, prints the reason and makes the program exit with code 2. This catches escaping errors and lost entries before you rely on the files.
+
+The Firefox backup is verified differently: it is parsed again and must equal the tree it was serialized from, and all GUIDs must be unique.
 
 The check proves that the file contains what was read. It cannot prove that the browser's own importer accepts every entry, so test the import once on the new machine.
 

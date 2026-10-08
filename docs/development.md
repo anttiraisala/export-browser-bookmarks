@@ -17,6 +17,10 @@ python3 -m unittest discover -s tests -v
 
 The tests build small synthetic profiles in a temporary directory: a Chromium `Bookmarks` file, an Opera-style profile with nested roots and a root-level profile, and a Firefox `places.sqlite` with folders, separators, tags, a smart bookmark and an untitled bookmark. They cover timestamp conversion, all readers, HTML round-trip verification, discovery, file permissions, option handling and the generated import guide.
 
+### Checking the Firefox backup against a real file
+
+The unit tests use small synthetic databases. The backup writer was additionally checked with a real Firefox backup: the `moz_bookmarks`, `moz_places` and `favicons.sqlite` tables were rebuilt from that file, the exporter was run on them, and the output was compared with the original. It was byte-identical. This proves that the writer reproduces Firefox's serialization (key order, empty folders, positions, timestamps, icons); it does not exercise the SQL queries against a real database, which the probe reports and the field use cover. The real file contains private data and is not part of the repository. To repeat the check with your own backup, rebuild the tables from it as described and compare the bytes.
+
 ## The probe
 
 `tools/probe.py` prints which browsers and profiles exist on a machine and how their bookmark stores are structured. It writes `probe-report.json` in the current directory.

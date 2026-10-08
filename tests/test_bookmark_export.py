@@ -202,6 +202,118 @@ class FirefoxReaderTests(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.profile.iterdir()), ["places.sqlite"])
 
 
+class FirefoxBackupTests(unittest.TestCase):
+    """The backup must look like the file Firefox writes with Bookmarks -> Backup."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.profile = Path(self.tmp.name) / "p.default"
+        self.profile.mkdir()
+        create_firefox_db(self.profile / "places.sqlite")
+        self.source = be.Source("firefox", "native", "default", "", self.profile)
+        self.rows = be.firefox_rows(self.source)
+
+    def tree(self, icons=None):
+        return be.build_firefox_backup(self.rows, icons)
+
+    def test_root_structure_and_indexes(self):
+        tree = self.tree()
+        self.assertEqual(
+            list(tree),
+            ["guid", "title", "index", "dateAdded", "lastModified", "id", "typeCode", "type", "root", "children"],
+        )
+        self.assertEqual(tree["root"], "placesRoot")
+        self.assertEqual(
+            [child["root"] for child in tree["children"]],
+            ["bookmarksMenuFolder", "toolbarFolder", "unfiledBookmarksFolder", "mobileFolder"],
+        )
+        # The tags root is left out, but the positions Firefox stores are kept.
+        self.assertEqual([child["index"] for child in tree["children"]], [0, 1, 3, 4])
+
+    def test_empty_folders_have_no_children_key(self):
+        menu, _toolbar, _unfiled, mobile = self.tree()["children"]
+        self.assertNotIn("children", menu)
+        self.assertNotIn("children", mobile)
+
+    def test_node_shapes_and_key_order(self):
+        _menu, toolbar, unfiled, _mobile = self.tree()["children"]
+        folder, smart = toolbar["children"]
+        example, separator = folder["children"]
+        self.assertEqual(
+            list(example),
+            ["guid", "title", "index", "dateAdded", "lastModified", "id", "typeCode", "type", "uri", "tags"],
+        )
+        self.assertEqual(example["dateAdded"], 1577836800000000)
+        self.assertEqual(example["tags"], "reading")
+        self.assertEqual(
+            list(separator),
+            ["guid", "title", "index", "dateAdded", "lastModified", "id", "typeCode", "type"],
+        )
+        self.assertEqual((separator["title"], separator["typeCode"]), ("", 3))
+        self.assertTrue(smart["uri"].startswith("place:"))
+        self.assertEqual(unfiled["children"][0]["title"], "")
+
+    def test_tag_folders_are_not_exported_as_bookmarks(self):
+        text = be.render_firefox_backup(self.tree())
+        self.assertNotIn('"g20"', text)
+        self.assertNotIn('"g21"', text)
+        self.assertEqual(
+            be.firefox_backup_stats(self.tree()),
+            {"bookmarks": 3, "folders": 5, "separators": 1},
+        )
+
+    def test_icon_uri_sits_between_type_code_and_type(self):
+        tree = self.tree({"https://example.com/": "https://example.com/favicon.ico"})
+        example = tree["children"][1]["children"][0]["children"][0]
+        keys = list(example)
+        self.assertEqual(example["iconUri"], "https://example.com/favicon.ico")
+        self.assertEqual(keys[keys.index("typeCode") + 1], "iconUri")
+        self.assertEqual(keys[keys.index("iconUri") + 1], "type")
+
+    def test_icons_prefer_the_widest_icon(self):
+        conn = sqlite3.connect(str(self.profile / "favicons.sqlite"))
+        conn.executescript(
+            """
+            CREATE TABLE moz_icons (id INTEGER PRIMARY KEY, icon_url TEXT, width INTEGER);
+            CREATE TABLE moz_pages_w_icons (id INTEGER PRIMARY KEY, page_url TEXT);
+            CREATE TABLE moz_icons_to_pages (page_id INTEGER, icon_id INTEGER);
+            INSERT INTO moz_icons VALUES (1, 'https://example.com/big.png', 32);
+            INSERT INTO moz_icons VALUES (2, 'https://example.com/small.png', 16);
+            INSERT INTO moz_pages_w_icons VALUES (1, 'https://example.com/');
+            INSERT INTO moz_icons_to_pages VALUES (1, 1);
+            INSERT INTO moz_icons_to_pages VALUES (1, 2);
+            """
+        )
+        conn.commit()
+        conn.close()
+        self.assertEqual(
+            be.firefox_icons(self.source),
+            {"https://example.com/": "https://example.com/big.png"},
+        )
+        self.assertEqual(sorted(p.name for p in self.profile.iterdir()), ["favicons.sqlite", "places.sqlite"])
+
+    def test_missing_favicons_database_gives_no_icons(self):
+        self.assertEqual(be.firefox_icons(self.source), {})
+
+    def test_serialization_is_compact_utf8_without_trailing_newline(self):
+        tree = self.tree()
+        tree["children"][2]["children"][0]["title"] = "Café ☕"
+        text = be.render_firefox_backup(tree)
+        self.assertTrue(text.startswith('{"guid":"root________","title":"","index":0,'))
+        self.assertNotIn("\n", text)
+        self.assertIn("Café ☕", text)
+        self.assertNotIn("\\u00e9", text)
+
+    def test_verification_detects_tampering(self):
+        tree = self.tree()
+        text = be.render_firefox_backup(tree)
+        self.assertEqual(be.verify_firefox_backup(text, tree), [])
+        tampered = text.replace("https://example.com/", "https://other.example/")
+        self.assertTrue(be.verify_firefox_backup(tampered, tree))
+        self.assertTrue(be.verify_firefox_backup("{not json", tree))
+
+
 class HtmlTests(unittest.TestCase):
     def test_round_trip_with_special_characters(self):
         roots = [
@@ -295,8 +407,33 @@ class ExportTests(unittest.TestCase):
         self.assertTrue((self.out / "keep.txt").exists())
 
     def test_no_json_option(self):
-        self.export(write_json=False)
+        self.export(write_json=False, write_firefox_backup=False)
         self.assertEqual(list(self.out.glob("*.json")), [self.out / "manifest.json"])
+
+    def test_firefox_backup_is_written_and_verified(self):
+        manifest = self.export()
+        entry = next(e for e in manifest["entries"] if e["browser"] == "firefox" and e["status"] == "ok")
+        self.assertEqual(entry["firefox_backup_file"], "firefox_default.firefox-backup.json")
+        self.assertEqual(entry["firefox_backup_stats"], {"bookmarks": 3, "folders": 5, "separators": 1})
+        self.assertTrue(entry["verified"])
+        text = (self.out / "firefox_default.firefox-backup.json").read_text(encoding="utf-8")
+        self.assertTrue(text.startswith('{"guid":"root________"'))
+        self.assertFalse(text.endswith("\n"))
+        guide = (self.out / "IMPORT.md").read_text(encoding="utf-8")
+        self.assertIn("firefox_default.firefox-backup.json", guide)
+        self.assertIn("Restore", guide)
+
+    def test_no_firefox_backup_option(self):
+        manifest = self.export(write_firefox_backup=False)
+        self.assertEqual(list(self.out.glob("*.firefox-backup.json")), [])
+        self.assertTrue((self.out / "firefox_default.json").exists())
+        entry = next(e for e in manifest["entries"] if e["browser"] == "firefox" and e["status"] == "ok")
+        self.assertNotIn("firefox_backup_file", entry)
+        self.assertNotIn("Restore", (self.out / "IMPORT.md").read_text(encoding="utf-8"))
+
+    def test_only_firefox_gets_a_backup(self):
+        self.export()
+        self.assertEqual([p.name for p in self.out.glob("*.firefox-backup.json")], ["firefox_default.firefox-backup.json"])
 
     def test_profile_filter_by_display_name(self):
         manifest = self.export(browsers=("chromium",), profiles=["work"])
@@ -326,6 +463,11 @@ class CommandLineTests(unittest.TestCase):
         )
         self.assertEqual(args.browser, ["brave", "edge"])
         self.assertTrue(args.no_json)
+        self.assertFalse(args.no_firefox_backup)
+
+    def test_no_firefox_backup_flag(self):
+        args = be.build_parser().parse_args(["export", "--no-firefox-backup"])
+        self.assertTrue(args.no_firefox_backup)
 
 
 if __name__ == "__main__":

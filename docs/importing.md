@@ -18,6 +18,16 @@ The generated `IMPORT.md` in the export folder lists the files and steps for exa
 
 Folders, tags, separators and the toolbar folder are restored. Firefox places the content in the matching roots (toolbar, menu, other bookmarks).
 
+### Exact restore from the Firefox backup file
+
+The `.firefox-backup.json` file is in the same format as the backups Firefox writes itself.
+
+1. Press `Ctrl+Shift+O` to open the Library.
+2. Choose **Import and Backup**, then **Restore**, then **Choose File...**
+3. Select the `.firefox-backup.json` file.
+
+Restore **replaces all existing bookmarks** in the profile, so use it on a fresh profile, or when you want the profile to match the old machine exactly. Use the HTML import instead when you want to merge the bookmarks into a profile that already has some. GUIDs, tags and the order of items are kept.
+
 ## Chromium
 
 1. Open `chrome://bookmarks` and use the three-dot menu in the top right.

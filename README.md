@@ -41,7 +41,7 @@ Install your browsers and start each one once. Then import the matching `.html` 
 
 | Browser | How to import the `.html` file |
 |---|---|
-| Firefox | Press `Ctrl+Shift+O`, then **Import and Backup**, then **Import Bookmarks from HTML...** |
+| Firefox | Press `Ctrl+Shift+O`, then **Import and Backup**, then **Import Bookmarks from HTML...**. For an exact copy that replaces the current bookmarks, choose **Restore**, then **Choose File...** and pick the `.firefox-backup.json` file instead. |
 | Chromium | Open `chrome://bookmarks`, three-dot menu, **Import bookmarks** |
 | Brave | Open `brave://settings/importData`, choose **Bookmarks HTML File** |
 | Edge | Open `edge://settings/profiles/importBrowsingData`, choose the bookmarks HTML file |
@@ -64,6 +64,7 @@ rm -r ~/bookmarks-export
 bookmarks-export/
   firefox_default-release.html   import this into Firefox
   firefox_default-release.json   lossless archive (dates, tags), not for import
+  firefox_default-release.firefox-backup.json   Firefox's own backup format, for an exact restore
   chromium_Default.html
   chromium_Default.json
   brave_Default.html
@@ -95,13 +96,14 @@ Developed against probe reports from Ubuntu 24.04 and 26.04 (GNOME and Unity 7) 
 | `--profile NAME` | Only profiles with this name, directory name or display name. Repeatable. |
 | `--install TYPE` | Only this install type, such as `snap` or `native`. Repeatable. |
 | `--no-json` | Do not write the JSON archives. |
+| `--no-firefox-backup` | Do not write the Firefox backup file. |
 | `--force` | Allow writing into a non-empty output directory. |
 
 Exit codes: `0` success, `1` nothing exported or fatal error, `2` finished, but some profile failed or did not verify.
 
 ## Not exported
 
-Favicons, history, passwords, extensions and Firefox smart bookmarks (`place:` queries). Opera Speed Dial entries become normal bookmarks after import. Items in the Opera or Chromium trash are skipped.
+History, passwords and extensions. Favicons are not exported either, except the icon URLs stored in the Firefox backup file. Firefox smart bookmarks (`place:` queries) are left out of the HTML files but kept in the Firefox backup. Firefox search keywords and bookmark descriptions are not exported yet. Opera Speed Dial entries become normal bookmarks after import. Items in the Opera or Chromium trash are skipped.
 
 ## Safety
 
@@ -119,4 +121,4 @@ Favicons, history, passwords, extensions and Firefox smart bookmarks (`place:` q
 
 ## Status
 
-The exporter is covered by unit tests with synthetic profiles modeled on real probe reports. Confirm your own result by checking that the command finishes with exit code `0` and that you can find your bookmarks after importing. Reports of browser versions that behave differently are welcome as issues.
+The exporter is covered by unit tests with synthetic profiles modeled on real probe reports. The Firefox backup writer was also checked against a real Firefox backup file: the databases were rebuilt from that file, exported again, and the result was byte-identical to the original. Confirm your own result by checking that the command finishes with exit code `0` and that you can find your bookmarks after importing. Reports of browser versions that behave differently are welcome as issues.

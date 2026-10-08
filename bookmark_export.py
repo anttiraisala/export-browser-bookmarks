@@ -39,9 +39,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, TypeVar
 
-__version__ = "0.1.0"
+T = TypeVar("T")
+
+__version__ = "0.2.0"
 FORMAT_ID = "bookmark-export/1"
 
 BROWSERS = ("firefox", "chromium", "brave", "edge", "opera")
@@ -117,6 +119,8 @@ class ReadResult:
     roots: list[Node]
     skipped: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+    # Raw Firefox rows, kept so that the backup writer uses the same snapshot.
+    rows: Optional[list[tuple]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +382,7 @@ FIREFOX_TAGS_ROOT = "tags________"
 
 _FIREFOX_QUERY = (
     "SELECT b.id, b.type, b.fk, b.parent, b.title, b.dateAdded, b.lastModified, "
-    "b.guid, p.url "
+    "b.guid, p.url, b.position "
     "FROM moz_bookmarks b LEFT JOIN moz_places p ON p.id = b.fk "
     "ORDER BY b.parent, b.position"
 )
@@ -400,38 +404,88 @@ def _query_firefox(db_path: Path) -> list[tuple]:
         conn.close()
 
 
-def read_firefox(source: Source) -> ReadResult:
-    rows: Optional[list[tuple]] = None
+_FIREFOX_ICON_QUERY = (
+    "SELECT p.page_url, i.icon_url, i.width "
+    "FROM moz_pages_w_icons p "
+    "JOIN moz_icons_to_pages ip ON ip.page_id = p.id "
+    "JOIN moz_icons i ON i.id = ip.icon_id "
+    "ORDER BY i.id"
+)
+
+
+def _query_firefox_icons(db_path: Path) -> dict[str, str]:
+    """Map each page URL to the URL of its widest known icon."""
+    conn = sqlite3.connect(str(db_path))
+    try:
+        best: dict[str, tuple[int, str]] = {}
+        for page_url, icon_url, width in conn.execute(_FIREFOX_ICON_QUERY):
+            if not page_url or not icon_url:
+                continue
+            size = int(width or 0)
+            current = best.get(page_url)
+            if current is None or size > current[0]:
+                best[page_url] = (size, icon_url)
+        return {page: icon for page, (_size, icon) in best.items()}
+    finally:
+        conn.close()
+
+
+def _copy_sqlite(source: Path, target_dir: Path) -> Path:
+    """Copy a SQLite database and its write-ahead log into ``target_dir``."""
+    copy = target_dir / source.name
+    shutil.copyfile(source, copy)
+    wal = source.with_name(source.name + "-wal")
+    wal_copy = target_dir / (source.name + "-wal")
+    if wal.is_file():
+        shutil.copyfile(wal, wal_copy)
+    elif wal_copy.exists():
+        wal_copy.unlink()
+    return copy
+
+
+def _snapshot_query(db_path: Path, query: Callable[[Path], T]) -> T:
+    """Run ``query`` against a private copy of ``db_path``.
+
+    The browser may write while we copy, so the snapshot is retried a few times.
+    The original files are never opened.
+    """
     last_error: Optional[Exception] = None
     with tempfile.TemporaryDirectory(prefix="bookmark-export-") as tmp:
-        copy = Path(tmp) / "places.sqlite"
-        # The browser may write while we copy; retry if the snapshot is inconsistent.
         for _ in range(3):
             try:
-                shutil.copyfile(source.store, copy)
-                wal = source.path / "places.sqlite-wal"
-                wal_copy = Path(tmp) / "places.sqlite-wal"
-                if wal.is_file():
-                    shutil.copyfile(wal, wal_copy)
-                elif wal_copy.exists():
-                    wal_copy.unlink()
-                rows = _query_firefox(copy)
-                break
+                return query(_copy_sqlite(db_path, Path(tmp)))
             except (OSError, sqlite3.Error) as exc:
                 last_error = exc
-    if rows is None:
-        raise ExportError(f"cannot read {source.store}: {last_error}")
+    raise ExportError(f"cannot read {db_path}: {last_error}")
 
+
+def firefox_rows(source: Source) -> list[tuple]:
+    """Return all bookmark rows with their URLs, read from a snapshot.
+
+    Row layout: id, type, fk, parent, title, dateAdded, lastModified, guid, url, position.
+    """
+    return _snapshot_query(source.store, _query_firefox)
+
+
+def firefox_icons(source: Source) -> dict[str, str]:
+    """Return page URL -> icon URL from ``favicons.sqlite`` (empty if it does not exist)."""
+    path = source.path / "favicons.sqlite"
+    if not path.is_file():
+        return {}
+    return _snapshot_query(path, _query_firefox_icons)
+
+
+def _index_firefox_rows(rows: list[tuple]) -> tuple[dict[int, list[tuple]], dict[str, tuple]]:
     by_parent: dict[int, list[tuple]] = {}
     by_guid: dict[str, tuple] = {}
     for row in rows:
         by_parent.setdefault(row[3], []).append(row)
         by_guid[row[7]] = row
-    tree_root = by_guid.get(FIREFOX_TREE_ROOT)
-    if tree_root is None:
-        raise ExportError("places.sqlite has no bookmark root (unexpected schema)")
+    return by_parent, by_guid
 
-    # Tags are stored as folders below the tags root; map place id -> tag names.
+
+def _firefox_tags(by_parent: dict[int, list[tuple]], by_guid: dict[str, tuple]) -> dict[int, list[str]]:
+    """Map place id -> tag names. Tags are stored as folders below the tags root."""
     tags_by_place: dict[int, list[str]] = {}
     tags_root = by_guid.get(FIREFOX_TAGS_ROOT)
     if tags_root is not None:
@@ -441,13 +495,24 @@ def read_firefox(source: Source) -> ReadResult:
             for entry in by_parent.get(tag_folder[0], []):
                 if entry[1] == 1 and entry[2] is not None:
                     tags_by_place.setdefault(entry[2], []).append(tag_folder[4] or "")
+    return tags_by_place
 
-    result = ReadResult(roots=[])
+
+def read_firefox(source: Source) -> ReadResult:
+    rows = firefox_rows(source)
+
+    by_parent, by_guid = _index_firefox_rows(rows)
+    tree_root = by_guid.get(FIREFOX_TREE_ROOT)
+    if tree_root is None:
+        raise ExportError("places.sqlite has no bookmark root (unexpected schema)")
+    tags_by_place = _firefox_tags(by_parent, by_guid)
+
+    result = ReadResult(roots=[], rows=rows)
     place_queries = 0
 
     def build(row: tuple) -> Optional[Node]:
         nonlocal place_queries
-        _id, kind, fk, _parent, title, added, modified, _guid, url = row
+        _id, kind, fk, _parent, title, added, modified, _guid, url, _position = row
         if kind == 2:
             node = Node(
                 "folder",
@@ -490,6 +555,124 @@ def read_firefox(source: Source) -> ReadResult:
     if place_queries:
         result.skipped["place_queries"] = place_queries
     return result
+
+
+# ---------------------------------------------------------------------------
+# Firefox backup JSON (the format of Firefox's own "Backup..." command)
+# ---------------------------------------------------------------------------
+
+FIREFOX_BACKUP_TYPES = {
+    1: "text/x-moz-place",
+    2: "text/x-moz-place-container",
+    3: "text/x-moz-place-separator",
+}
+FIREFOX_BACKUP_ROOT_NAMES = {
+    "root________": "placesRoot",
+    "menu________": "bookmarksMenuFolder",
+    "toolbar_____": "toolbarFolder",
+    "unfiled_____": "unfiledBookmarksFolder",
+    "mobile______": "mobileFolder",
+}
+# The tags root is not part of a Firefox backup; tags are stored on the bookmarks instead.
+FIREFOX_BACKUP_TOP_LEVEL = ("menu________", "toolbar_____", "unfiled_____", "mobile______")
+
+
+def build_firefox_backup(rows: list[tuple], icons: Optional[dict[str, str]] = None) -> dict:
+    """Build the tree Firefox writes for Bookmarks -> Manage -> Backup -> Save as JSON.
+
+    Key order, empty-title handling, microsecond timestamps and the omission of
+    ``children`` on empty folders follow the files Firefox itself produces.
+    Smart bookmarks (``place:`` queries) and non-web URLs are kept, because this
+    is a backup meant to be restored as it was.
+    """
+    icons = icons or {}
+    by_parent, by_guid = _index_firefox_rows(rows)
+    tree_root = by_guid.get(FIREFOX_TREE_ROOT)
+    if tree_root is None:
+        raise ExportError("places.sqlite has no bookmark root (unexpected schema)")
+    tags_by_place = _firefox_tags(by_parent, by_guid)
+    seen: set[int] = set()
+
+    def node(row: tuple) -> Optional[dict]:
+        row_id, kind, fk, _parent, title, added, modified, guid, url, position = row
+        if kind not in FIREFOX_BACKUP_TYPES or row_id in seen:
+            return None
+        if kind == 1 and not url:
+            return None
+        seen.add(row_id)
+        item: dict = {
+            "guid": guid,
+            "title": title or "",
+            "index": int(position or 0),
+            "dateAdded": int(added or 0),
+            "lastModified": int(modified or 0),
+            "id": row_id,
+            "typeCode": kind,
+        }
+        if kind == 1 and icons.get(url):
+            item["iconUri"] = icons[url]
+        item["type"] = FIREFOX_BACKUP_TYPES[kind]
+        if kind == 1:
+            item["uri"] = url
+            tags = sorted({tag for tag in tags_by_place.get(fk, []) if tag})
+            if tags:
+                item["tags"] = ",".join(tags)
+        if guid in FIREFOX_BACKUP_ROOT_NAMES:
+            item["root"] = FIREFOX_BACKUP_ROOT_NAMES[guid]
+        if kind == 2:
+            child_rows = by_parent.get(row_id, [])
+            if guid == FIREFOX_TREE_ROOT:
+                child_rows = [r for r in child_rows if r[7] in FIREFOX_BACKUP_TOP_LEVEL]
+            children = [child for child in (node(r) for r in child_rows) if child is not None]
+            if children:
+                item["children"] = children
+        return item
+
+    tree = node(tree_root)
+    assert tree is not None
+    return tree
+
+
+def render_firefox_backup(tree: dict) -> str:
+    """Serialize like Firefox does: compact, one line, raw UTF-8, no trailing newline."""
+    return json.dumps(tree, ensure_ascii=False, separators=(",", ":"))
+
+
+def firefox_backup_stats(tree: dict) -> dict[str, int]:
+    """Count bookmarks, folders (the places root excluded) and separators."""
+    stats = {"bookmarks": 0, "folders": 0, "separators": 0}
+    stack = list(tree.get("children", []))
+    while stack:
+        item = stack.pop()
+        kind = item.get("typeCode")
+        if kind == 1:
+            stats["bookmarks"] += 1
+        elif kind == 2:
+            stats["folders"] += 1
+            stack.extend(item.get("children", []))
+        elif kind == 3:
+            stats["separators"] += 1
+    return stats
+
+
+def verify_firefox_backup(text: str, tree: dict) -> list[str]:
+    """Parse the serialized backup again and compare it with the tree it came from."""
+    try:
+        parsed = json.loads(text)
+    except ValueError as exc:
+        return [f"backup is not valid JSON: {exc}"]
+    problems: list[str] = []
+    if parsed != tree:
+        problems.append("backup differs from the tree it was built from")
+    guids: list[str] = []
+    stack = [parsed]
+    while stack:
+        item = stack.pop()
+        guids.append(item.get("guid", ""))
+        stack.extend(item.get("children", []))
+    if len(guids) != len(set(guids)):
+        problems.append("backup contains duplicate GUIDs")
+    return problems
 
 
 READERS: dict[str, Callable[[Source], ReadResult]] = {
@@ -691,6 +874,7 @@ def render_import_guide(manifest: dict) -> str:
         "",
         "Import each `.html` file into the matching browser and profile on the new machine.",
         "The `.json` files are lossless archives and are not meant to be imported.",
+        "The exception is the Firefox backup (`*.firefox-backup.json`); see the Firefox steps below.",
         "Menu names differ slightly between browser versions.",
         "",
         "## Files",
@@ -714,6 +898,22 @@ def render_import_guide(manifest: dict) -> str:
         lines += ["", f"### {BROWSER_LABELS[browser]}", ""]
         for number, step in enumerate(IMPORT_STEPS[browser], start=1):
             lines.append(f"{number}. {step}")
+        if browser == "firefox":
+            backups = [
+                e["firefox_backup_file"]
+                for e in entries
+                if e["browser"] == "firefox" and e.get("firefox_backup_file")
+            ]
+            if backups:
+                lines += [
+                    "",
+                    "Exact restore from a Firefox backup. This replaces all existing bookmarks "
+                    "in the profile and keeps tags, GUIDs and order:",
+                    "",
+                    "1. Press Ctrl+Shift+O to open the Library.",
+                    "2. Choose Import and Backup, then Restore, then Choose File...",
+                    "3. Select the matching backup file: " + ", ".join(f"`{name}`" for name in backups),
+                ]
     lines += [
         "",
         "## Notes",
@@ -757,6 +957,7 @@ def export_all(
     profiles: Optional[list[str]] = None,
     installs: Optional[list[str]] = None,
     write_json: bool = True,
+    write_firefox_backup: bool = True,
     force: bool = False,
     log: Callable[[str], None] = print,
 ) -> dict:
@@ -830,6 +1031,19 @@ def export_all(
                     json.dumps(archive, ensure_ascii=False, indent=1) + "\n",
                 )
                 entry["json_file"] = f"{unique}.json"
+            if source.browser == "firefox" and write_firefox_backup and result.rows is not None:
+                icons: dict[str, str] = {}
+                try:
+                    icons = firefox_icons(source)
+                except ExportError as exc:
+                    result.warnings.append(f"icons were left out of the Firefox backup: {exc}")
+                backup_tree = build_firefox_backup(result.rows, icons)
+                backup_text = render_firefox_backup(backup_tree)
+                problems.extend(verify_firefox_backup(backup_text, backup_tree))
+                backup_name = f"{unique}.firefox-backup.json"
+                _write_private(out_dir / backup_name, backup_text)
+                entry["firefox_backup_file"] = backup_name
+                entry["firefox_backup_stats"] = firefox_backup_stats(backup_tree)
             entry["stats"] = stats
             entry["skipped"] = result.skipped
             entry["warnings"] = list(result.warnings)
@@ -840,6 +1054,7 @@ def export_all(
             log(
                 f"  {label}: {stats['bookmarks']} bookmarks, {stats['folders']} folders"
                 f" -> {entry['html_file']}"
+                + (f", {entry['firefox_backup_file']}" if "firefox_backup_file" in entry else "")
                 + ("" if not problems else "  VERIFICATION FAILED")
             )
             for warning in entry["warnings"]:
@@ -900,6 +1115,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             profiles=args.profile,
             installs=args.install,
             write_json=not args.no_json,
+            write_firefox_backup=not args.no_firefox_backup,
             force=args.force,
         )
     except ExportError as exc:
@@ -933,6 +1149,11 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--profile", action="append", help="limit to a profile name or display name (repeatable)")
     export.add_argument("--install", action="append", help="limit to an install type such as snap or native (repeatable)")
     export.add_argument("--no-json", action="store_true", help="do not write the JSON archives")
+    export.add_argument(
+        "--no-firefox-backup",
+        action="store_true",
+        help="do not write the Firefox backup JSON (Firefox's own backup format)",
+    )
     export.add_argument("--force", action="store_true", help="allow writing into a non-empty output directory")
     export.set_defaults(func=cmd_export)
     return parser

@@ -43,6 +43,7 @@ python3 bookmark_export.py export --out ~/bookmarks-export
 | `--profile NAME` | Limit to a profile. Matches the profile name, the directory name or the display name, ignoring case. Repeatable. |
 | `--install TYPE` | Limit to an install type: `native`, `xdg`, `snap`, `flatpak`, `beta`, `developer`. Repeatable. |
 | `--no-json` | Skip the JSON archives. |
+| `--no-firefox-backup` | Skip the Firefox backup file (`*.firefox-backup.json`). |
 | `--force` | Write into a non-empty output directory. Existing files with the same names are overwritten. |
 
 ### Examples
