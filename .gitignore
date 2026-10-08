@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.pyc
+
+# Never commit exported bookmark data or probe output
+bookmarks-export*/
+probe-report.json
